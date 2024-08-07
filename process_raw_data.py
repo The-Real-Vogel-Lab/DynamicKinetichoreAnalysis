@@ -193,8 +193,6 @@ def read_image_file(path) -> np.ndarray:
 
     The indexing order for this array is [FRAME, CHANNEL, X, Y, Z].
 
-    TODO: Implement read_czi and read_tiff.
-
     :param path: The path to the .czi file.
     :return: The `numpy.ndarray` containing the data. The index order is `[F, C, X, Y, Z]`.
     """
