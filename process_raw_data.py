@@ -15,8 +15,9 @@ from scipy.stats import multivariate_normal
 DATABASE_FILE_PATHS = []
 DATA_OUTPUT_PATH = '.'
 CENTROMERE_CHANEL = None
+BULK_CHANNEL = None
 VOXEL_SIZE = [0.0313, 0.0313, 0.2]
-JSON_KEYS = ['cell_id', 'spindle_pole_track_path', 'centromere_track_path', 'image_path', 'strain']
+JSON_KEYS = ['cell_id', 'spindle_pole_track_path', 'centromere_track_path', 'image_path', 'strain', 'Centromere_path', 'Kinetochore_path']
 
 
 class DatabaseExtractionException(Exception):
@@ -335,9 +336,12 @@ def process_database_cell(path) -> pd.DataFrame:
     cell_data = load_json(path)
 
     # Load the individual histogram data for the centromere separation if it exists.
-    histogram_path = os.path.join(os.path.dirname(path), 'frame_kymo')
-    if not os.path.exists(histogram_path):
-        histogram_path = None
+    centromere_histogram_path = os.path.join(os.path.dirname(path), cell_data['Centromere_path'])
+    bulk_histogram_path = os.path.join(os.path.dirname(path), cell_data['Kinetochore_path'])
+    if not os.path.exists(centromere_histogram_path):
+        centromere_histogram_path = None
+    if not os.path.exists(bulk_histogram_path):
+        bulk_histogram_path = None
 
     # Load the data we will synthesize to get the output.
     image_path = os.path.join(get_dir(path), cell_data['image_path'])
@@ -356,6 +360,7 @@ def process_database_cell(path) -> pd.DataFrame:
     spindle_length = []
     centromere_separation_trackmate = []
     centromere_separation_gaussian = []
+    bulk_separation_gaussian = []
     frames = np.array(range(1, num_frames + 1))
     op_track_id = identify_old_pole_track_id(spindle_pole_track_data)
     np_track_id = identify_new_pole_track_id(spindle_pole_track_data)
@@ -368,9 +373,9 @@ def process_database_cell(path) -> pd.DataFrame:
             )
         else:
             centromere_separation_trackmate.append(np.nan)
-        if histogram_path is not None:
+        if centromere_histogram_path is not None:
             try:
-                p = os.path.join(histogram_path, f'{f-1}.csv')
+                p = os.path.join(centromere_histogram_path, f'{f-1}.csv')
                 centromere_separation_gaussian.append(
                     compute_centromere_separation_gaussian(pd.read_csv(p))
                 )
@@ -378,11 +383,22 @@ def process_database_cell(path) -> pd.DataFrame:
                 centromere_separation_gaussian.append(np.nan)
         else:
             centromere_separation_gaussian.append(np.nan)
+        if bulk_histogram_path is not None:
+            try:
+                p = os.path.join(bulk_histogram_path, f'{f-1}.csv')
+                bulk_separation_gaussian.append(
+                    compute_centromere_separation_gaussian(pd.read_csv(p))
+                )
+            except FileNotFoundError as e:
+                bulk_separation_gaussian.append(np.nan)
+        else:
+            bulk_separation_gaussian.append(np.nan)
 
     res = pd.DataFrame({
         'Spindle Length': spindle_length,
         'Centromere Separation (Trackmate)': centromere_separation_trackmate,
-        'Centromere Separation (Gaussian)': centromere_separation_gaussian
+        'Centromere Separation (Gaussian)': centromere_separation_gaussian,
+        'Bulk Separation (Gaussian)': bulk_separation_gaussian
     },
         index=frames
     )
@@ -394,12 +410,14 @@ if __name__ == '__main__':
     config = dotenv_values('./database_processing_settings.env')
     DATABASE_FILE_PATHS = np.array(glob.glob(config['INPUT_PATH'], recursive=True))
     DATA_OUTPUT_PATH = config['OUTPUT_PATH']
-    CENTROMERE_CHANEL = int(config['CENTROMERE_CHANEL'])
+    CENTROMERE_CHANNEL = int(config['CENTROMERE_CHANNEL'])
+    BULK_CHANNEL = int(config['BULK_CHANNEL'])
     VOXEL_SIZE = np.array([float(t) for t in config['VOXEL_SIZE'][1:-1].split(",")])
     print("Loaded environment data.")
     print("\tINPUT_PATH:", config['INPUT_PATH'])
     print("\tOUTPUT_PATH:", config['OUTPUT_PATH'])
-    print("\tCENTROMERE_CHANEL:", config['CENTROMERE_CHANEL'])
+    print("\tCENTROMERE_CHANEL:", config['CENTROMERE_CHANNEL'])
+    print("\tBULK_CHANEL:", config['BULK_CHANNEL'])
     print("\tVOXEL_SIZE:", config['VOXEL_SIZE'])
     print(f"Processing {len(DATABASE_FILE_PATHS)} files")
     print(DATABASE_FILE_PATHS)
