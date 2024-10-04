@@ -1,3 +1,6 @@
 venv
-output/..
+output/**
 .idea
+
+.DS_store
+**/.DS_store

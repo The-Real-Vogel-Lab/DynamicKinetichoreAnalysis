@@ -214,7 +214,13 @@ def load_trackmate_data(path) -> pd.DataFrame:
     :param path: The path to the trackmate file to load data from.
     :return: A pandas DataFrame containing the data from the trackmate csv output (properly formatted.)
     """
-    res = pd.read_csv(path).iloc[3:].reset_index(drop=True).drop(columns='LABEL')
+    try:
+        res = pd.read_csv(path).iloc[3:].reset_index(drop=True).drop(columns='LABEL')
+    except Exception as e:
+        try:
+            res = pd.read_csv(path).iloc[3:].reset_index(drop=True).drop(columns='Label')
+        except Exception as e:
+            res = pd.read_csv(path).iloc[3:].reset_index(drop=True)
     res = res.apply(pd.to_numeric)
 
     return res
