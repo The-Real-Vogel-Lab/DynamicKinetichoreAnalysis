@@ -1,3 +1,4 @@
+import itertools
 import json
 import pandas as pd
 import numpy as np
@@ -11,13 +12,15 @@ from skimage import io  # for reading TIFF files.
 import tifffile
 import scipy
 from scipy.stats import multivariate_normal
+from scipy.signal import find_peaks, peak_widths
+from itertools import product
 
 DATABASE_FILE_PATHS = []
 DATA_OUTPUT_PATH = '.'
 CENTROMERE_CHANEL = None
 BULK_CHANNEL = None
 VOXEL_SIZE = [0.0313, 0.0313, 0.2]
-JSON_KEYS = ['cell_id', 'spindle_pole_track_path', 'centromere_track_path', 'image_path', 'strain', 'Centromere_path', 'Kinetochore_path']
+JSON_KEYS = ['cell_id', 'spindle_pole_track_path', 'centromere_track_path', 'image_path', 'strain', 'Centromere_path']#, 'Kinetochore_path']
 
 
 class DatabaseExtractionException(Exception):
@@ -248,7 +251,7 @@ def compute_spindle_length(df, frame, op_track_id, np_track_id):
     return np.sqrt(np.sum(np.square(op_pos - np_pos)))
 
 
-def get_centromere_foci_points(df, frame):
+def get_foci_points(df, frame):
     track_id = identify_centromere_track_id(df)
     tdf = df[df['FRAME'] == frame]
     tdf = tdf[tdf['TRACK_ID'] == track_id]
@@ -275,8 +278,36 @@ def get_centromere_foci_points(df, frame):
         ])
         return [pos_one, pos_two]
     else:
-        raise ValueError("Unexpected number of centromere foci.")
+        raise ValueError("Unexpected number of centromere/bulk foci.")
 
+
+def get_kinetichore_mt_distance(bulk_df, spindle_df, frame, op_track_id, np_track_id) -> float:
+    # Get the spindle pole positions.
+    tdf = spindle_df[spindle_df['FRAME'] == frame]
+    op_df = tdf[tdf['TRACK_ID'] == op_track_id]
+    np_df = tdf[tdf['TRACK_ID'] == np_track_id]
+
+    if (len(op_df.index) != 1) or (len(np_df.index) != 1):
+        return np.nan
+
+    op_pos = np.array([
+        op_df["POSITION_X"].iloc[0],
+        op_df["POSITION_Y"].iloc[0],
+        op_df["POSITION_Z"].iloc[0]
+    ])
+    np_pos = np.array([
+        np_df["POSITION_X"].iloc[0],
+        np_df["POSITION_Y"].iloc[0],
+        np_df["POSITION_Z"].iloc[0]
+    ])
+
+    spindle_points = [op_pos, np_pos]
+
+    # Get the bulk points.
+    bulk_points = get_foci_points(bulk_df, frame)
+
+    distances = [np.sqrt(np.sum(np.square(spindle_point - bulk_point))) for spindle_point, bulk_point in product(spindle_points, bulk_points)]
+    return np.min(distances) if len(distances) > 0 else np.nan
 
 def compute_centromere_separation_from_points(points):
     if len(points) == 2:
@@ -285,44 +316,112 @@ def compute_centromere_separation_from_points(points):
     else:
         return np.nan
 
+def gauss(x, mu, sigma, A):
+    return A * np.exp(-(x - mu) ** 2 / 2 / sigma ** 2)
 
-def compute_centromere_separation_gaussian(data: pd.DataFrame) -> float:
-    def gauss(x, mu, sigma, A):
-        return A * np.exp(-(x - mu) ** 2 / 2 / sigma ** 2)
+def bimodal(x, mu1, sigma1, A1, mu2, sigma2, A2):
+    return gauss(x, mu1, sigma1, A1) + gauss(x, mu2, sigma2, A2)
 
-    def bimodal(x, mu1, sigma1, A1, mu2, sigma2, A2):
-        return gauss(x, mu1, sigma1, A1) + gauss(x, mu2, sigma2, A2)
+def _initial_guesses(x, y, bounds, n_restarts=8, seed=0):
+    """Seeds for the local fit: peak-detection guesses plus random restarts."""
+    lo = np.array([b[0] for b in bounds])
+    hi = np.array([b[1] for b in bounds])
+    dx = np.median(np.diff(x))
 
-    x = np.array(data[data.columns[0]])  # The first column must be length
-    y = np.array(data[data.columns[1]])  # The second column must be intensity
-    y = y / np.max(y)
+    guesses = []
+    peaks, props = find_peaks(y, prominence=0.05 * np.max(y))
+    if len(peaks):
+        peaks = peaks[np.argsort(props['prominences'])[::-1]]
+        widths = peak_widths(y, peaks, rel_height=0.5)[0] * dx / 2.3548
+        widths = np.clip(widths, lo[1], hi[1])
+        if len(peaks) >= 2:
+            i, j = peaks[0], peaks[1]
+            guesses.append([x[i], widths[0], y[i], x[j], widths[1], y[j]])
+        i = peaks[0]  # single peak: seed as two overlapping components
+        guesses.append([x[i] - widths[0], widths[0], y[i],
+                        x[i] + widths[0], widths[0], y[i]])
 
-    # Restrict the bounds to have two significant components.
-    # And to values that make sense.
+    rng = np.random.default_rng(seed)  # fixed seed keeps fits reproducible
+    guesses += [lo + rng.random(6) * (hi - lo) for _ in range(n_restarts)]
+    return [np.clip(np.asarray(g, float), lo + 1e-12, hi - 1e-12) for g in guesses]
+
+
+def err_fit(x, y, bounds):
+    lo = np.array([b[0] for b in bounds])
+    hi = np.array([b[1] for b in bounds])
+
+    best_params, best_err = None, np.inf
+    for p0 in _initial_guesses(x, y, bounds):
+        try:
+            params, _ = scipy.optimize.curve_fit(
+                bimodal, x, y, p0=p0, bounds=(lo, hi), maxfev=20000
+            )
+        except (RuntimeError, ValueError):
+            continue
+        err = np.mean(np.square(y - bimodal(x, *params)))
+        if err < best_err:
+            best_err, best_params = err, params
+
+    if best_params is None:  # every restart failed - fall back to the global search
+        return scipy.optimize.dual_annealing(
+            lambda p: np.mean(np.square(y - bimodal(x, *p))), bounds
+        ).x
+    return best_params
+
+def fit_bimodal_gaussian(data: pd.DataFrame, normalize: bool = True):
+    """
+    Fit a bimodal Gaussian (two-component GMM) to histogram data and return the fit parameters.
+
+    :param data: A DataFrame where the first column is distance and the second is intensity.
+    :param normalize: If True, normalize y by its max before fitting (default). If False, fit on raw y values.
+    :return: A dict with keys:
+        - 'x': the distance array
+        - 'y': the intensity array used for fitting (normalized if normalize=True, raw otherwise)
+        - 'params': tuple of (mu1, sigma1, A1, mu2, sigma2, A2)
+        - 'distance': the absolute distance between the two peaks
+    """
+    x = np.array(data[data.columns[0]])
+    y = np.array(data[data.columns[1]])
+    y = y - np.min(y)  # Shift y to be non-negative for fitting.
+
+    if normalize:
+        y = y / np.max(y)
+
     max_sigma = 0.3
     min_sigma = 0.01
-    min_intensity = 0.3
+
+    if normalize:
+        min_intensity = 0.2
+        max_intensity = 1.0
+    else:
+        min_intensity = 0.2 * np.max(y)
+        max_intensity = np.max(y)
+
+    bounds_buffer = 0.2 * np.max(x)
     bounds = [
-        (0, np.max(x)),
+        (0 - bounds_buffer, np.max(x) + bounds_buffer),
         (min_sigma, max_sigma),
-        (min_intensity, 1.0),
-        (0, np.max(x)),
+        (min_intensity, max_intensity),
+        (0 - bounds_buffer, np.max(x) + bounds_buffer),
         (min_sigma, max_sigma),
-        (min_intensity, 1.0)
+        (min_intensity, max_intensity)
     ]
 
-    def err_fit(x, y):
-        def err(p):
-            res = bimodal(x, *p)
-            return np.mean(np.square(y - res))
-
-        result = scipy.optimize.dual_annealing(err, bounds)
-        return result.x
-
-    params = err_fit(x, y)
+    params = err_fit(x, y, bounds)
     dist = np.abs(params[0] - params[3])
 
-    return dist
+    return {
+        'x': x,
+        'y': y,
+        'params': tuple(params),
+        'distance': dist
+    }
+
+
+def compute_centromere_separation_gaussian(data: pd.DataFrame, normalize: bool = True) -> float:
+    result = fit_bimodal_gaussian(data, normalize=normalize)
+    return result['distance']
+
 
 def load_json(path):
     with open(path, 'r') as f:
@@ -340,14 +439,16 @@ def get_dir(path):
 def process_database_cell(path) -> pd.DataFrame:
     # Load the JSON for the database entry.
     cell_data = load_json(path)
+    if 'Kinetochore_track_path' not in cell_data.keys():
+        cell_data['Kinetochore_track_path'] = ''
 
     # Load the individual histogram data for the centromere separation if it exists.
     centromere_histogram_path = os.path.join(os.path.dirname(path), cell_data['Centromere_path'])
-    bulk_histogram_path = os.path.join(os.path.dirname(path), cell_data['Kinetochore_path'])
+    bulk_histogram_path = None#os.path.join(os.path.dirname(path), cell_data['Kinetochore_path'])
     if not os.path.exists(centromere_histogram_path):
         centromere_histogram_path = None
-    if not os.path.exists(bulk_histogram_path):
-        bulk_histogram_path = None
+    # if not os.path.exists(bulk_histogram_path):
+    #     bulk_histogram_path = None
 
     # Load the data we will synthesize to get the output.
     image_path = os.path.join(get_dir(path), cell_data['image_path'])
@@ -356,6 +457,8 @@ def process_database_cell(path) -> pd.DataFrame:
     spindle_pole_track_data = load_trackmate_data(spindle_pole_track_path)
     centromere_track_path = os.path.join(get_dir(path), cell_data['centromere_track_path']) if cell_data['centromere_track_path'] != "" else None
     centromere_track_data = load_trackmate_data(centromere_track_path) if centromere_track_path is not None else None
+    bulk_track_path = os.path.join(get_dir(path), cell_data['Kinetochore_track_path']) if cell_data['Kinetochore_track_path'] != "" else None # TODO: What is the key for this?
+    bulk_track_data = load_trackmate_data(bulk_track_path) if bulk_track_path is not None else None
 
     # Iterate over the frames of the video in order to get the data.
     if centromere_track_data is not None:
@@ -367,13 +470,14 @@ def process_database_cell(path) -> pd.DataFrame:
     centromere_separation_trackmate = []
     centromere_separation_gaussian = []
     bulk_separation_gaussian = []
+    estimated_kinetichore_mt_distance = []
     frames = np.array(range(1, num_frames + 1))
     op_track_id = identify_old_pole_track_id(spindle_pole_track_data)
     np_track_id = identify_new_pole_track_id(spindle_pole_track_data)
     for f in frames:
         spindle_length.append(compute_spindle_length(spindle_pole_track_data, f, op_track_id, np_track_id))
         if centromere_track_data is not None:
-            centromere_points = get_centromere_foci_points(centromere_track_data, f)
+            centromere_points = get_foci_points(centromere_track_data, f)
             centromere_separation_trackmate.append(
                 compute_centromere_separation_from_points(centromere_points)
             )
@@ -399,12 +503,16 @@ def process_database_cell(path) -> pd.DataFrame:
                 bulk_separation_gaussian.append(np.nan)
         else:
             bulk_separation_gaussian.append(np.nan)
+        if bulk_track_data is not None:
+            estimated_kinetichore_mt_distance.append(get_kinetichore_mt_distance(bulk_track_data, spindle_pole_track_data, f, op_track_id, np_track_id))
+        else:
+            estimated_kinetichore_mt_distance.append(np.nan)
 
     res = pd.DataFrame({
         'Spindle Length': spindle_length,
-        'Centromere Separation (Trackmate)': centromere_separation_trackmate,
-        'Centromere Separation (Gaussian)': centromere_separation_gaussian,
-        'Bulk Separation (Gaussian)': bulk_separation_gaussian
+        'Centromere Separation': centromere_separation_gaussian,
+        'Bulk Separation': bulk_separation_gaussian,
+        'Estimated kMT Length': estimated_kinetichore_mt_distance,
     },
         index=frames
     )
@@ -416,14 +524,10 @@ if __name__ == '__main__':
     config = dotenv_values('./database_processing_settings.env')
     DATABASE_FILE_PATHS = np.array(glob.glob(config['INPUT_PATH'], recursive=True))
     DATA_OUTPUT_PATH = config['OUTPUT_PATH']
-    CENTROMERE_CHANNEL = int(config['CENTROMERE_CHANNEL'])
-    BULK_CHANNEL = int(config['BULK_CHANNEL'])
     VOXEL_SIZE = np.array([float(t) for t in config['VOXEL_SIZE'][1:-1].split(",")])
     print("Loaded environment data.")
     print("\tINPUT_PATH:", config['INPUT_PATH'])
     print("\tOUTPUT_PATH:", config['OUTPUT_PATH'])
-    print("\tCENTROMERE_CHANEL:", config['CENTROMERE_CHANNEL'])
-    print("\tBULK_CHANEL:", config['BULK_CHANNEL'])
     print("\tVOXEL_SIZE:", config['VOXEL_SIZE'])
     print(f"Processing {len(DATABASE_FILE_PATHS)} files")
     print(DATABASE_FILE_PATHS)
@@ -443,5 +547,6 @@ if __name__ == '__main__':
             continue
         except Exception as e:
             print(f"Error Processing file at: {cell_entry_path}")
-            print(e)
+            print(e, '\n')
             continue
+            # raise e
